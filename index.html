@@ -12,9 +12,9 @@
 </head>
 <body class="bg-white">
   <div id="root"></div>
+
   <script type="text/babel">
-    const { useMemo, useRef, useState } = React;
-    if (window.pdfjsLib) window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    const { useEffect, useMemo, useRef, useState } = React;
 
     const money = (v, d = 2) => "$" + Number(v || 0).toLocaleString("th-TH", { maximumFractionDigits: d });
     const signed = (v) => (Number(v || 0) >= 0 ? "+" : "-") + money(Math.abs(Number(v || 0)));
@@ -22,6 +22,21 @@
     const csvCell = (v) => /[",\n]/.test(String(v ?? "")) ? '"' + String(v ?? "").replace(/"/g, '""') + '"' : String(v ?? "");
     const duration = (m) => Number(m || 0) < 1 ? Math.round(Number(m || 0) * 60) + "s" : Number(m || 0) < 60 ? Number(m || 0).toLocaleString("th-TH", { maximumFractionDigits: 1 }) + "m" : (Number(m || 0) / 60).toLocaleString("th-TH", { maximumFractionDigits: 1 }) + "h";
     const streak = (arr) => { let best = 0, cur = 0; arr.forEach(x => { if (x) { cur++; best = Math.max(best, cur); } else cur = 0; }); return best; };
+
+    window.addEventListener("error", (event) => {
+      const el = document.getElementById("global-error");
+      if (el) el.textContent = "Runtime error: " + (event.message || "Script error");
+    });
+
+    function getPdfJs() {
+      const lib = window.pdfjsLib;
+      if (!lib) return null;
+      // Sandbox-friendly config: do not use external worker. External workers often fail in sandboxed iframes.
+      try {
+        lib.GlobalWorkerOptions.workerSrc = "";
+      } catch (_) {}
+      return lib;
+    }
 
     function parseDateValue(value) {
       const m = String(value || "").match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);
@@ -52,16 +67,75 @@
       return "60m+";
     }
 
+    function parseTradeRows(text, fileName) {
+      const normalized = String(text || "").replace(/\u00a0/g, " ").replace(/\n/g, " ").replace(/[ \t]+/g, " ").trim();
+      const toNum = v => Number(String(v || "0").replace(/,/g, ""));
+      const rx = /\b([A-Z]{1,6})\s+(\d{6}[CP]\d{8})\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2}:\d{2},GMT[+-]\d{2})\s+(\d{2}\/\d{2}\/\d{4})\s+(BUY|SELL)\s+(CALL|PUT)\s+([\d,.]+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+(?:\.\d+)?)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)/g;
+      const out = [];
+      let m;
+      while ((m = rx.exec(normalized)) !== null) {
+        const [raw, underlying, optionCode, tradeDateOnly, time, settleDate, side, type, strike, expiryDate, q, price, gross, net] = m;
+        const pstTime = convertGMT7TimeToPSTSameDate(time), symbol = underlying + " " + optionCode;
+        out.push({
+          id: fileName + "-" + out.length + "-" + symbol + "-" + tradeDateOnly + "-" + pstTime + "-" + side,
+          underlying, optionCode, symbol, side: side === "SELL" ? "Sell" : "Buy", type,
+          strike: toNum(strike), expiryDate, qty: toNum(q), price: toNum(price), grossAmount: toNum(gross), netAmount: toNum(net), amount: toNum(gross), currency: "USD",
+          tradeDate: tradeDateOnly + " " + pstTime, tradeDateOnly, time: pstTime, settleDate, fileName, raw
+        });
+      }
+      return out;
+    }
+
+    function buildFifoPairs(trades) {
+      const inv = new Map(), pairs = [];
+      [...trades].sort((a, b) => parseDateValue(a.tradeDate) - parseDateValue(b.tradeDate)).forEach(t => {
+        const symbol = t.symbol, q = Math.abs(+t.qty || 0), gross = Math.abs(+t.grossAmount || 0), net = Math.abs(+t.netAmount || 0), px = Math.abs(+t.price || 0);
+        if (!symbol || !q || !gross) return;
+        if (!inv.has(symbol)) inv.set(symbol, []);
+        if (t.side === "Buy") inv.get(symbol).push({ ...t, remainingQty: q, unitGross: gross / q, unitNet: net / q, tradedPrice: px });
+        else {
+          let rem = q; const lots = inv.get(symbol), unitGross = gross / q, unitNet = net / q;
+          while (rem > 0 && lots.length) {
+            const lot = lots[0], matched = Math.min(rem, lot.remainingQty), buyGross = matched * lot.unitGross, sellGross = matched * unitGross, buyNet = matched * lot.unitNet, sellNet = matched * unitNet;
+            const pl = sellGross - buyGross, netPL = sellNet - buyNet, holdingMinutes = Math.max(0, (parseDateValue(t.tradeDate) - parseDateValue(lot.tradeDate)) / 60000);
+            pairs.push({ id: t.id + "-" + lot.id + "-" + matched, underlying: t.underlying, symbol, qty: matched, buyDate: lot.tradeDate, sellDate: t.tradeDate, buyPrice: lot.tradedPrice, sellPrice: px, buyAmount: buyGross, sellAmount: sellGross, buyNetAmount: buyNet, sellNetAmount: sellNet, pl, netPL, feeDrag: pl - netPL, plPct: buyGross ? pl / buyGross * 100 : 0, holdingMinutes, holdingBucket: bucketHold(holdingMinutes), timeBucket: bucketTime(t.tradeDate), sourceBuyFile: lot.fileName, sourceSellFile: t.fileName });
+            lot.remainingQty -= matched; rem -= matched;
+            if (lot.remainingQty <= 0.000001) lots.shift();
+          }
+          if (rem > 0) pairs.push({ id: t.id + "-unmatched-" + rem, underlying: t.underlying, symbol, qty: rem, buyDate: "", sellDate: t.tradeDate, buyPrice: 0, sellPrice: px, buyAmount: 0, sellAmount: rem * unitGross, buyNetAmount: 0, sellNetAmount: rem * unitNet, pl: 0, netPL: 0, feeDrag: 0, plPct: 0, holdingMinutes: 0, holdingBucket: "Unmatched", timeBucket: bucketTime(t.tradeDate), sourceBuyFile: "ไม่พบ Buy ก่อนหน้า", sourceSellFile: t.fileName, unmatched: true });
+        }
+      });
+      return pairs.sort((a, b) => parseDateValue(a.sellDate) - parseDateValue(b.sellDate));
+    }
+
+    function runSelfTests() {
+      const sample = "QQQ 260424C00660000 24/04/2026 23:58:06,GMT+07 27/04/2026 BUY CALL 660.00 24/04/2026 10 1.73 1,730.00 1,730.48 QQQ 260424C00660000 24/04/2026 23:58:22,GMT+07 27/04/2026 SELL CALL 660.00 24/04/2026 10 1.83 1,830.00 1,829.45";
+      const trades = parseTradeRows(sample, "test.pdf");
+      const pairs = buildFifoPairs(trades);
+      return [
+        { name: "GMT+7 23:58:06 converts to PST same date 08:58:06", pass: convertGMT7TimeToPSTSameDate("23:58:06,GMT+07") === "08:58:06,PST" },
+        { name: "Parser reads 2 trade rows", pass: trades.length === 2 },
+        { name: "FIFO creates 1 matched pair", pass: pairs.filter(p => !p.unmatched).length === 1 },
+        { name: "FIFO gross P/L = 100", pass: Math.round((pairs[0]?.pl || 0) * 100) / 100 === 100 },
+        { name: "parseDateValue returns sortable number", pass: parseDateValue("24/04/2026 08:58:06,PST") > 0 }
+      ];
+    }
+
     function WebullDashboard() {
       const inputRef = useRef(null);
-      const [files, setFiles] = useState([]), [rows, setRows] = useState([]), [rawText, setRawText] = useState(""), [loading, setLoading] = useState(false), [error, setError] = useState(""), [query, setQuery] = useState(""), [tab, setTab] = useState("overview");
+      const [files, setFiles] = useState([]), [rows, setRows] = useState([]), [rawText, setRawText] = useState(""), [loading, setLoading] = useState(false), [error, setError] = useState(""), [query, setQuery] = useState(""), [tab, setTab] = useState("overview"), [ignoreUnmatched, setIgnoreUnmatched] = useState(false);
+      const [tests] = useState(runSelfTests());
 
       async function readPdfText(file) {
-        if (!window.pdfjsLib) throw new Error("PDF.js โหลดไม่สำเร็จ");
-        const pdf = await window.pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+        const pdfjs = getPdfJs();
+        if (!pdfjs) throw new Error("PDF.js โหลดไม่สำเร็จ: sandbox อาจบล็อก CDN script");
+        const data = await file.arrayBuffer();
+        const loadingTask = pdfjs.getDocument({ data, disableWorker: true, useWorkerFetch: false, isEvalSupported: false });
+        const pdf = await loadingTask.promise;
         const pages = [];
         for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
-          const content = await (await pdf.getPage(pageNo)).getTextContent();
+          const page = await pdf.getPage(pageNo);
+          const content = await page.getTextContent({ disableCombineTextItems: false });
           const buckets = new Map();
           content.items.map(i => ({ str: String(i.str || "").trim(), x: i.transform[4], y: Math.round(i.transform[5]) })).filter(i => i.str).forEach(i => {
             if (!buckets.has(i.y)) buckets.set(i.y, []);
@@ -70,25 +144,6 @@
           pages.push([...buckets.entries()].sort((a, b) => b[0] - a[0]).map(([, xs]) => xs.sort((a, b) => a.x - b.x).map(x => x.str).join(" ").replace(/\s+/g, " ").trim()).join("\n"));
         }
         return pages.join("\n");
-      }
-
-      function parseTradeRows(text, fileName) {
-        const normalized = String(text || "").replace(/\u00a0/g, " ").replace(/\n/g, " ").replace(/[ \t]+/g, " ").trim();
-        const toNum = v => Number(String(v || "0").replace(/,/g, ""));
-        const rx = /\b([A-Z]{1,6})\s+(\d{6}[CP]\d{8})\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2}:\d{2},GMT[+-]\d{2})\s+(\d{2}\/\d{2}\/\d{4})\s+(BUY|SELL)\s+(CALL|PUT)\s+([\d,.]+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+(?:\.\d+)?)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)/g;
-        const out = [];
-        let m;
-        while ((m = rx.exec(normalized)) !== null) {
-          const [raw, underlying, optionCode, tradeDateOnly, time, settleDate, side, type, strike, expiryDate, q, price, gross, net] = m;
-          const pstTime = convertGMT7TimeToPSTSameDate(time), symbol = underlying + " " + optionCode;
-          out.push({
-            id: fileName + "-" + out.length + "-" + symbol + "-" + tradeDateOnly + "-" + pstTime + "-" + side,
-            underlying, optionCode, symbol, side: side === "SELL" ? "Sell" : "Buy", type,
-            strike: toNum(strike), expiryDate, qty: toNum(q), price: toNum(price), grossAmount: toNum(gross), netAmount: toNum(net), amount: toNum(gross), currency: "USD",
-            tradeDate: tradeDateOnly + " " + pstTime, tradeDateOnly, time: pstTime, settleDate, fileName, raw
-          });
-        }
-        return out;
       }
 
       async function handleFiles(selected) {
@@ -105,36 +160,16 @@
           }
           setRows(allRows); setRawText(allText.join("\n\n"));
           if (!allRows.length) setError("อ่าน PDF ได้ แต่ยังจับ Trade Records ไม่เจอ");
-        } catch (e) { setError("อ่าน PDF ไม่สำเร็จ: " + (e?.message || "ไม่ทราบสาเหตุ")); }
-        finally { setLoading(false); }
-      }
-
-      function buildFifoPairs(trades) {
-        const inv = new Map(), pairs = [];
-        [...trades].sort((a, b) => parseDateValue(a.tradeDate) - parseDateValue(b.tradeDate)).forEach(t => {
-          const symbol = t.symbol, q = Math.abs(+t.qty || 0), gross = Math.abs(+t.grossAmount || 0), net = Math.abs(+t.netAmount || 0), px = Math.abs(+t.price || 0);
-          if (!symbol || !q || !gross) return;
-          if (!inv.has(symbol)) inv.set(symbol, []);
-          if (t.side === "Buy") inv.get(symbol).push({ ...t, remainingQty: q, unitGross: gross / q, unitNet: net / q, tradedPrice: px });
-          else {
-            let rem = q; const lots = inv.get(symbol), unitGross = gross / q, unitNet = net / q;
-            while (rem > 0 && lots.length) {
-              const lot = lots[0], matched = Math.min(rem, lot.remainingQty), buyGross = matched * lot.unitGross, sellGross = matched * unitGross, buyNet = matched * lot.unitNet, sellNet = matched * unitNet;
-              const pl = sellGross - buyGross, netPL = sellNet - buyNet, holdingMinutes = Math.max(0, (parseDateValue(t.tradeDate) - parseDateValue(lot.tradeDate)) / 60000);
-              pairs.push({ id: t.id + "-" + lot.id + "-" + matched, underlying: t.underlying, symbol, qty: matched, buyDate: lot.tradeDate, sellDate: t.tradeDate, buyPrice: lot.tradedPrice, sellPrice: px, buyAmount: buyGross, sellAmount: sellGross, buyNetAmount: buyNet, sellNetAmount: sellNet, pl, netPL, feeDrag: pl - netPL, plPct: buyGross ? pl / buyGross * 100 : 0, holdingMinutes, holdingBucket: bucketHold(holdingMinutes), timeBucket: bucketTime(t.tradeDate), sourceBuyFile: lot.fileName, sourceSellFile: t.fileName });
-              lot.remainingQty -= matched; rem -= matched;
-              if (lot.remainingQty <= 0.000001) lots.shift();
-            }
-            if (rem > 0) pairs.push({ id: t.id + "-unmatched-" + rem, underlying: t.underlying, symbol, qty: rem, buyDate: "", sellDate: t.tradeDate, buyPrice: 0, sellPrice: px, buyAmount: 0, sellAmount: rem * unitGross, buyNetAmount: 0, sellNetAmount: rem * unitNet, pl: 0, netPL: 0, feeDrag: 0, plPct: 0, holdingMinutes: 0, holdingBucket: "Unmatched", timeBucket: bucketTime(t.tradeDate), sourceBuyFile: "ไม่พบ Buy ก่อนหน้า", sourceSellFile: t.fileName, unmatched: true });
-          }
-        });
-        return pairs.sort((a, b) => parseDateValue(a.sellDate) - parseDateValue(b.sellDate));
+        } catch (e) {
+          console.error(e);
+          setError("อ่าน PDF ไม่สำเร็จ: " + (e?.message || "ไม่ทราบสาเหตุ") + " — หากรันใน sandbox, ระบบนี้ใช้ disableWorker:true เพื่อเลี่ยง external worker แล้ว");
+        } finally { setLoading(false); }
       }
 
       const fifoPairs = useMemo(() => buildFifoPairs(rows), [rows]);
       const q = query.trim().toLowerCase();
       const filterText = x => !q || Object.values(x).join(" ").toLowerCase().includes(q);
-      const filteredRows = rows.filter(filterText), filteredPairs = fifoPairs.filter(filterText);
+      const filteredRows = rows.filter(filterText), filteredPairs = fifoPairs.filter(p => !ignoreUnmatched || !p.unmatched).filter(filterText);
 
       const roundTrips = useMemo(() => {
         const map = new Map();
@@ -154,10 +189,12 @@
         return fifoPairs.filter(p => !p.unmatched).map((p, i) => { cum += p.pl; peak = Math.max(peak, cum); return { i: i + 1, time: p.sellDate, symbol: p.symbol, pl: p.pl, cumulative: cum, drawdown: cum - peak }; });
       }, [fifoPairs]);
 
-      const daily = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => (p.sellDate || "Unknown").split(" ")[0]), [fifoPairs]);
-      const byTicker = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => p.underlying).sort((a,b)=>b.grossPL-a.grossPL), [fifoPairs]);
-      const byTime = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => p.timeBucket).sort((a,b)=>a.key.localeCompare(b.key)), [fifoPairs]);
-      const byHolding = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => p.holdingBucket), [fifoPairs]);
+      const netBalanceCurve = useMemo(() => {
+        let balance = 0;
+        const points = [{ i: 0, time: "Start", symbol: "", netPL: 0, balance: 0 }];
+        fifoPairs.filter(p => !p.unmatched).forEach((p, i) => { balance += Number(p.netPL || 0); points.push({ i: i + 1, time: p.sellDate, symbol: p.symbol, netPL: Number(p.netPL || 0), balance }); });
+        return points;
+      }, [fifoPairs]);
 
       function groupRows(items, keyFn) {
         const map = new Map();
@@ -169,6 +206,11 @@
         });
         return [...map.values()].map(x => ({ ...x, winRate: x.pairs ? x.wins / x.pairs * 100 : 0, roi: x.cost ? x.grossPL / x.cost * 100 : 0 }));
       }
+
+      const daily = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => (p.sellDate || "Unknown").split(" ")[0]), [fifoPairs]);
+      const byTicker = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => p.underlying).sort((a,b)=>b.grossPL-a.grossPL), [fifoPairs]);
+      const byTime = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => p.timeBucket).sort((a,b)=>a.key.localeCompare(b.key)), [fifoPairs]);
+      const byHolding = useMemo(() => groupRows(fifoPairs.filter(p => !p.unmatched), p => p.holdingBucket), [fifoPairs]);
 
       const openPositions = useMemo(() => {
         const inv = new Map();
@@ -187,28 +229,30 @@
         return { valid: valid.length, total, net, fees, winRate, avgWin, avgLoss, profitFactor: gl ? gp/gl : gp ? Infinity : 0, expectancy: winRate/100*avgWin - lossRate/100*avgLoss, maxDD: equityCurve.reduce((m,x)=>Math.min(m,x.drawdown),0), avgHold: valid.length ? valid.reduce((s,p)=>s+p.holdingMinutes,0)/valid.length : 0, unmatched: fifoPairs.filter(p=>p.unmatched).length, maxTradesHour: byTime.length ? Math.max(...byTime.map(x=>x.pairs)) : 0, lossStreak: streak(valid.map(p=>p.pl<0)) };
       }, [fifoPairs, equityCurve, byTime]);
 
-      const alerts = [metrics.maxTradesHour >= 20 && `High activity: ${metrics.maxTradesHour} FIFO pairs in one PST hour`, metrics.lossStreak >= 4 && `Loss streak: ${metrics.lossStreak}`, metrics.unmatched > 0 && `Unmatched sells: ${metrics.unmatched}`, metrics.fees > Math.abs(metrics.total) * 0.25 && metrics.fees > 0 && "Fee drag is large vs realized P/L"].filter(Boolean);
+      const alerts = [metrics.maxTradesHour >= 20 && `High activity: ${metrics.maxTradesHour} FIFO pairs in one PST hour`, metrics.lossStreak >= 4 && `Loss streak: ${metrics.lossStreak}`, !ignoreUnmatched && metrics.unmatched > 0 && `Unmatched sells: ${metrics.unmatched}`, metrics.fees > Math.abs(metrics.total) * 0.25 && metrics.fees > 0 && "Fee drag is large vs realized P/L"].filter(Boolean);
       const winners = fifoPairs.filter(p=>!p.unmatched).sort((a,b)=>b.pl-a.pl).slice(0,10), losers = fifoPairs.filter(p=>!p.unmatched).sort((a,b)=>a.pl-b.pl).slice(0,10);
 
-      function clearAll() { setFiles([]); setRows([]); setRawText(""); setError(""); setQuery(""); if (inputRef.current) inputRef.current.value = ""; }
+      function clearAll() { setFiles([]); setRows([]); setRawText(""); setError(""); setQuery(""); setIgnoreUnmatched(false); if (inputRef.current) inputRef.current.value = ""; }
       function downloadCsv(name, data) { if (!data.length) return; const headers = Object.keys(data[0]); const csv = [headers.join(","), ...data.map(r => headers.map(h => csvCell(r[h])).join(","))].join("\n"); const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" })); a.download = name; a.click(); URL.revokeObjectURL(a.href); }
 
-      return <div className="min-h-screen bg-white text-slate-900"><div className="mx-auto max-w-7xl px-5 py-8">
+      return <div className="min-h-screen bg-white text-slate-900"><div id="global-error" className="mx-auto max-w-7xl px-5 pt-4 text-sm font-bold text-rose-600"></div><div className="mx-auto max-w-7xl px-5 py-8">
         <section className="rounded-[2rem] border border-fuchsia-100 bg-gradient-to-br from-pink-50 via-white to-violet-50 p-8 shadow-sm">
-          <div className="flex flex-col gap-7 lg:flex-row lg:items-center lg:justify-between"><div><div className="mb-4 inline-flex rounded-full bg-white px-4 py-2 text-sm font-semibold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100">AI-Native · Cash Account · FIFO Execution Intelligence</div><h1 className="bg-gradient-to-r from-pink-500 via-fuchsia-600 to-violet-600 bg-clip-text text-4xl font-black tracking-tight text-transparent md:text-5xl">Webull Pro Trader Dashboard</h1><p className="mt-4 max-w-3xl text-sm leading-6 text-slate-600">อ่าน Webull PDF หลายไฟล์, แปลง Time จาก GMT+7 เป็น PST โดยคง Date เดิม, คำนวณ FIFO P/L, round trips, equity curve, risk, execution quality และ behavior analytics</p></div><div className="flex flex-col gap-3 sm:flex-row"><input ref={inputRef} type="file" accept="application/pdf,.pdf" multiple className="hidden" onChange={e=>handleFiles(e.target.files)} /><button onClick={()=>inputRef.current?.click()} className="rounded-2xl bg-gradient-to-r from-pink-500 via-fuchsia-500 to-violet-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-fuchsia-200">เลือกไฟล์ PDF</button><button onClick={clearAll} className="rounded-2xl border border-fuchsia-100 bg-white px-6 py-3 text-sm font-bold text-slate-700 shadow-sm">ล้างข้อมูล</button></div></div>
-          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-6"><Metric label="Trade Rows" value={rows.length} hint="จำนวน trade records ทั้งหมดที่อ่านได้จาก PDF ทุกไฟล์" /><Metric label="FIFO Pairs" value={metrics.valid} hint="จำนวนคู่ Buy/Sell ที่จับคู่ได้ด้วย FIFO โดยไม่รวม unmatched sell" /><Metric label="Realized P/L" value={signed(metrics.total)} tone={metrics.total>=0?"good":"bad"} hint="กำไร/ขาดทุนรวมแบบ Gross จาก FIFO pairs"/><Metric label="Net P/L" value={signed(metrics.net)} tone={metrics.net>=0?"good":"bad"} hint="กำไร/ขาดทุนรวมหลังรวมผลของค่า fee ตาม Net Amount ใน PDF"/><Metric label="Win Rate" value={metrics.winRate.toLocaleString("th-TH",{maximumFractionDigits:1})+"%"} hint="สัดส่วน FIFO pairs ที่มีกำไรเทียบกับจำนวน pairs ทั้งหมด"/><Metric label="Max DD" value={signed(metrics.maxDD)} tone="bad" hint="drawdown สูงสุดของ intraday equity curve จาก realized P/L"/></div>
+          <div className="flex flex-col gap-7 lg:flex-row lg:items-center lg:justify-between"><div><div className="mb-4 inline-flex rounded-full bg-white px-4 py-2 text-sm font-semibold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100">AI-Native · Cash Account · FIFO Execution Intelligence</div><h1 className="bg-gradient-to-r from-pink-500 via-fuchsia-600 to-violet-600 bg-clip-text text-4xl font-black tracking-tight text-transparent md:text-5xl">Webull Pro Trader Dashboard</h1><p className="mt-4 max-w-3xl text-sm leading-6 text-slate-600">Sandbox-safe PDF parser: uses PDF.js with <code>disableWorker:true</code>, converts Time from GMT+7 to PST while keeping Date unchanged, and computes FIFO P/L.</p></div><div className="flex flex-col gap-3 sm:flex-row"><input ref={inputRef} type="file" accept="application/pdf,.pdf" multiple className="hidden" onChange={e=>handleFiles(e.target.files)} /><button onClick={()=>inputRef.current?.click()} className="rounded-2xl bg-gradient-to-r from-pink-500 via-fuchsia-500 to-violet-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-fuchsia-200">เลือกไฟล์ PDF</button><button onClick={clearAll} className="rounded-2xl border border-fuchsia-100 bg-white px-6 py-3 text-sm font-bold text-slate-700 shadow-sm">ล้างข้อมูล</button></div></div>
+          <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-6"><Metric label="Trade Rows" value={rows.length} hint="จำนวน trade records ทั้งหมดที่อ่านได้จาก PDF ทุกไฟล์"/><Metric label="FIFO Pairs" value={metrics.valid} hint="จำนวนคู่ Buy/Sell ที่จับคู่ได้ด้วย FIFO โดยไม่รวม unmatched sell"/><Metric label="Realized P/L" value={signed(metrics.total)} tone={metrics.total>=0?"good":"bad"} hint="กำไร/ขาดทุนรวมแบบ Gross จาก FIFO pairs"/><Metric label="Net P/L" value={signed(metrics.net)} tone={metrics.net>=0?"good":"bad"} hint="กำไร/ขาดทุนรวมหลังรวมผลของค่า fee ตาม Net Amount ใน PDF"/><Metric label="Win Rate" value={metrics.winRate.toLocaleString("th-TH",{maximumFractionDigits:1})+"%"} hint="สัดส่วน FIFO pairs ที่มีกำไรเทียบกับจำนวน pairs ทั้งหมด"/><Metric label="Max DD" value={signed(metrics.maxDD)} tone="bad" hint="drawdown สูงสุดของ intraday equity curve จาก realized P/L"/></div>
         </section>
+
+        <section className="mt-6 rounded-3xl border border-fuchsia-100 bg-white p-5 shadow-sm"><h2 className="text-lg font-black text-slate-900">Self Tests</h2><div className="mt-3 grid gap-2">{tests.map(t=><div key={t.name} className={(t.pass?"text-emerald-700 bg-emerald-50":"text-rose-700 bg-rose-50")+" rounded-2xl px-4 py-3 text-sm font-bold"}>{t.pass?"✓":"✗"} {t.name}</div>)}</div></section>
 
         {files.length>0 && <section className="mt-6 rounded-3xl border border-fuchsia-100 bg-white p-5 shadow-sm"><div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between"><div><p className="mb-3 text-sm font-bold text-slate-700">ไฟล์ที่เลือก</p><div className="flex flex-wrap gap-2">{files.map(f=><span key={f.name} className="rounded-full bg-fuchsia-50 px-4 py-2 text-xs font-semibold text-fuchsia-700 ring-1 ring-fuchsia-100">{f.name}</span>)}</div></div><div className="flex flex-wrap gap-2"><SmallButton onClick={()=>downloadCsv("webull_trade_records.csv",rows)}>Export Trades</SmallButton><SmallButton onClick={()=>downloadCsv("webull_fifo_pairs.csv",fifoPairs)}>Export FIFO</SmallButton><SmallButton onClick={()=>downloadCsv("webull_round_trips.csv",roundTrips)}>Export Cycles</SmallButton></div></div></section>}
         {loading && <Notice text="กำลังอ่าน PDF..."/>}{error && <Notice text={error} danger/>}
 
-        <div className="sticky top-0 z-10 mt-6 rounded-3xl border border-fuchsia-100 bg-white/90 p-3 shadow-sm backdrop-blur"><div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between"><div className="flex flex-wrap gap-2">{[["overview","Overview"],["cycles","Round Trips"],["analytics","Analytics"],["records","Trade Records"],["debug","Debug"]].map(([id,label])=><button key={id} onClick={()=>setTab(id)} className={(tab===id?"bg-gradient-to-r from-pink-500 to-violet-600 text-white shadow-md shadow-fuchsia-100":"bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100")+" rounded-2xl px-4 py-2 text-sm font-black transition"}>{label}</button>)}</div><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="ค้นหา symbol, ticker, date, file..." className="w-full rounded-2xl border border-fuchsia-100 bg-white px-4 py-3 text-sm outline-none ring-fuchsia-200 focus:ring-4 lg:w-96" /></div></div>
+        <div className="sticky top-0 z-10 mt-6 rounded-3xl border border-fuchsia-100 bg-white/90 p-3 shadow-sm backdrop-blur"><div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between"><div className="flex flex-wrap gap-2">{[["overview","Overview"],["cycles","Round Trips"],["analytics","Analytics"],["records","Trade Records"],["debug","Debug"]].map(([id,label])=><button key={id} onClick={()=>setTab(id)} className={(tab===id?"bg-gradient-to-r from-pink-500 to-violet-600 text-white shadow-md shadow-fuchsia-100":"bg-fuchsia-50 text-fuchsia-700 hover:bg-fuchsia-100")+" rounded-2xl px-4 py-2 text-sm font-black transition"}>{label}</button>)}</div><div className="flex w-full flex-col gap-3 lg:w-auto lg:flex-row lg:items-center"><label className="flex cursor-pointer items-center gap-3 rounded-2xl border border-fuchsia-100 bg-fuchsia-50 px-4 py-3 text-sm font-bold text-fuchsia-700"><input type="checkbox" checked={ignoreUnmatched} onChange={e=>setIgnoreUnmatched(e.target.checked)} className="h-4 w-4 accent-fuchsia-600" />Ignore unmatched pairs</label><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="ค้นหา symbol, ticker, date, file..." className="w-full rounded-2xl border border-fuchsia-100 bg-white px-4 py-3 text-sm outline-none ring-fuchsia-200 focus:ring-4 lg:w-96" /></div></div></div>
 
-        {tab==="overview" && <><section className="mt-6 grid gap-4 lg:grid-cols-4"><Metric label="Profit Factor" value={Number.isFinite(metrics.profitFactor)?metrics.profitFactor.toLocaleString("th-TH",{maximumFractionDigits:2}):"∞"} hint="Gross profit หารด้วย Gross loss ยิ่งสูงยิ่งดี"/><Metric label="Expectancy / Pair" value={signed(metrics.expectancy)} tone={metrics.expectancy>=0?"good":"bad"} hint="ค่าเฉลี่ยคาดหวังต่อ FIFO pair = win rate × avg win - loss rate × avg loss"/><Metric label="Avg Win" value={money(metrics.avgWin)} tone="good" hint="กำไรเฉลี่ยของ winning FIFO pairs"/><Metric label="Avg Loss" value={money(metrics.avgLoss)} tone="bad" hint="ขาดทุนเฉลี่ยของ losing FIFO pairs"/><Metric label="Fee Drag" value={money(metrics.fees)} hint="ส่วนต่างระหว่าง Gross P/L และ Net P/L ที่สะท้อนต้นทุน fee/transaction"/><Metric label="Avg Holding" value={duration(metrics.avgHold)} hint="เวลาเฉลี่ยตั้งแต่ Buy ถึง Sell ของ FIFO pairs"/><Metric label="Max Trades / Hour" value={metrics.maxTradesHour} hint="จำนวน FIFO pairs สูงสุดที่ปิดในชั่วโมงเดียว ใช้ดู overtrading"/><Metric label="Loss Streak" value={metrics.lossStreak} tone={metrics.lossStreak>=4?"bad":"neutral"} hint="จำนวน losing FIFO pairs ติดต่อกันมากที่สุด"/></section>{alerts.length>0&&<section className="mt-6 rounded-3xl border border-amber-100 bg-amber-50 p-5 shadow-sm"><h2 className="text-lg font-black text-amber-900">Discipline Alerts</h2><div className="mt-3 grid gap-2 md:grid-cols-2">{alerts.map(a=><div key={a} className="rounded-2xl bg-white px-4 py-3 text-sm font-bold text-amber-800 shadow-sm">⚠️ {a}</div>)}</div></section>}<section className="mt-6 grid gap-6"><Equity data={equityCurve}/><Summary data={daily}/></section><section className="mt-6 grid gap-6"><Top title="Top 10 Winners" data={winners} good/><Top title="Top 10 Losers" data={losers}/></section></>}
+        {tab==="overview" && <><section className="mt-6 grid gap-4 lg:grid-cols-4"><Metric label="Profit Factor" value={Number.isFinite(metrics.profitFactor)?metrics.profitFactor.toLocaleString("th-TH",{maximumFractionDigits:2}):"∞"} hint="Gross profit หารด้วย Gross loss ยิ่งสูงยิ่งดี"/><Metric label="Expectancy / Pair" value={signed(metrics.expectancy)} tone={metrics.expectancy>=0?"good":"bad"} hint="ค่าเฉลี่ยคาดหวังต่อ FIFO pair = win rate × avg win - loss rate × avg loss"/><Metric label="Avg Win" value={money(metrics.avgWin)} tone="good" hint="กำไรเฉลี่ยของ winning FIFO pairs"/><Metric label="Avg Loss" value={money(metrics.avgLoss)} tone="bad" hint="ขาดทุนเฉลี่ยของ losing FIFO pairs"/><Metric label="Fee Drag" value={money(metrics.fees)} hint="ส่วนต่างระหว่าง Gross P/L และ Net P/L ที่สะท้อนต้นทุน fee/transaction"/><Metric label="Avg Holding" value={duration(metrics.avgHold)} hint="เวลาเฉลี่ยตั้งแต่ Buy ถึง Sell ของ FIFO pairs"/><Metric label="Max Trades / Hour" value={metrics.maxTradesHour} hint="จำนวน FIFO pairs สูงสุดที่ปิดในชั่วโมงเดียว ใช้ดู overtrading"/><Metric label="Loss Streak" value={metrics.lossStreak} tone={metrics.lossStreak>=4?"bad":"neutral"} hint="จำนวน losing FIFO pairs ติดต่อกันมากที่สุด"/></section>{alerts.length>0&&<section className="mt-6 rounded-3xl border border-amber-100 bg-amber-50 p-5 shadow-sm"><h2 className="text-lg font-black text-amber-900">Discipline Alerts</h2><div className="mt-3 grid gap-2 md:grid-cols-2">{alerts.map(a=><div key={a} className="rounded-2xl bg-white px-4 py-3 text-sm font-bold text-amber-800 shadow-sm">⚠️ {a}</div>)}</div></section>}<section className="mt-6 grid gap-6"><NetBalance data={netBalanceCurve}/><Equity data={equityCurve}/><Summary data={daily}/></section><section className="mt-6 grid gap-6"><Top title="Top 10 Winners" data={winners} good/><Top title="Top 10 Losers" data={losers}/></section></>}
         {tab==="cycles"&&<><RoundTrips data={filteredRoundTrips}/><Pairs data={filteredPairs}/></>}
         {tab==="analytics"&&<><section className="mt-6 grid gap-6"><Group title="Ticker Performance" data={byTicker} first="Ticker"/><Group title="Time-of-Day Performance (PST)" data={byTime} first="Time"/><Group title="Holding-Time Performance" data={byHolding} first="Holding"/></section><section className="mt-6 grid gap-6"><OpenPositions data={openPositions}/><FeeDrag data={daily}/></section></>}
         {tab==="records"&&<Records data={filteredRows} loading={loading}/>}        
-        {tab==="debug"&&<><Card title="Parser Notes"><p className="p-6 text-sm leading-6 text-slate-600">Regex สำหรับ Webull Thailand Trade Confirmation: Symbol, OptionCode, TradeDate, Time, SettlementDate, BUY/SELL, CALL/PUT, Strike, Expiry, Qty, Price, Gross, Net. Date ถือว่าเป็น PST อยู่แล้ว และแปลงเฉพาะ Time จาก GMT+7 เป็น PST.</p></Card>{rawText&&<details className="mt-6 rounded-3xl border border-fuchsia-100 bg-white p-6 shadow-sm"><summary className="cursor-pointer text-sm font-bold text-fuchsia-700">ดู Raw Text</summary><pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-2xl bg-slate-50 p-4 text-xs leading-5 text-slate-600">{rawText}</pre></details>}</>}
+        {tab==="debug"&&<><Card title="Parser Notes"><p className="p-6 text-sm leading-6 text-slate-600">PDF.js external worker is disabled with <code>disableWorker:true</code> to avoid sandbox worker/CORS failures. Regex supports Webull Thailand Trade Confirmation: Symbol, OptionCode, TradeDate, Time, SettlementDate, BUY/SELL, CALL/PUT, Strike, Expiry, Qty, Price, Gross, Net. Date ถือว่าเป็น PST อยู่แล้ว และแปลงเฉพาะ Time จาก GMT+7 เป็น PST.</p></Card>{rawText&&<details className="mt-6 rounded-3xl border border-fuchsia-100 bg-white p-6 shadow-sm"><summary className="cursor-pointer text-sm font-bold text-fuchsia-700">ดู Raw Text</summary><pre className="mt-4 max-h-96 overflow-auto whitespace-pre-wrap rounded-2xl bg-slate-50 p-4 text-xs leading-5 text-slate-600">{rawText}</pre></details>}</>}
       </div></div>;
     }
 
@@ -217,7 +261,9 @@
     function Notice({text,danger}){return <div className={(danger?"border-rose-100 bg-rose-50 text-rose-700":"border-fuchsia-100 bg-fuchsia-50 text-fuchsia-700")+" mt-6 rounded-3xl border p-6 text-sm font-bold"}>{text}</div>}
     function Card({title,sub,children}){return <section className="overflow-hidden rounded-3xl border border-fuchsia-100 bg-white shadow-sm"><div className="border-b border-fuchsia-100 px-6 py-5"><h2 className="text-lg font-black text-slate-900">{title}</h2>{sub&&<p className="text-sm text-slate-500">{sub}</p>}</div>{children}</section>}
     function Table({heads,children,empty}){return <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-gradient-to-r from-pink-50 via-fuchsia-50 to-violet-50 text-xs uppercase tracking-wide text-slate-500"><tr>{heads.map(h=><th key={h} className="px-4 py-4 font-black">{h}</th>)}</tr></thead><tbody className="divide-y divide-fuchsia-50">{React.Children.count(children)?children:<tr><td colSpan={heads.length} className="px-4 py-12 text-center text-slate-500">{empty}</td></tr>}</tbody></table></div>}
-    function Equity({data}){const w=720,h=260,p=28,vals=data.map(d=>d.cumulative),min=Math.min(0,...vals),max=Math.max(0,...vals),r=max-min||1,pts=data.map((d,i)=>`${p+(data.length<=1?0:i/(data.length-1)*(w-p*2))},${h-p-((d.cumulative-min)/r)*(h-p*2)}`).join(" "),zy=h-p-((0-min)/r)*(h-p*2);return <Card title="Intraday Equity Curve" sub="Cumulative realized FIFO P/L by sell time"><div className="p-5">{data.length?<svg viewBox={`0 0 ${w} ${h}`} className="h-72 w-full rounded-2xl bg-gradient-to-br from-pink-50 via-white to-violet-50"><line x1={p} x2={w-p} y1={zy} y2={zy} stroke="currentColor" className="text-slate-300" strokeDasharray="4 4"/><polyline fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" points={pts} className={data[data.length-1].cumulative>=0?"text-emerald-500":"text-rose-500"}/><text x={p} y="24" className="fill-slate-500 text-xs">High {money(max)}</text><text x={p} y={h-8} className="fill-slate-500 text-xs">Low {money(min)}</text></svg>:<Empty text="ยังไม่มี equity curve"/>}</div></Card>}
+    function ChartCard({ title, sub, data, valueKey, lineLabel, tradeKey }) { const [hover,setHover]=React.useState(null); const w=720,h=260,p=28,vals=data.map(d=>Number(d[valueKey]||0)),min=Math.min(0,...vals),max=Math.max(0,...vals),r=max-min||1; const pointFor=(d,i)=>({x:p+(data.length<=1?0:i/(data.length-1)*(w-p*2)),y:h-p-((Number(d[valueKey]||0)-min)/r)*(h-p*2),d}); const points=data.map(pointFor), pts=points.map(pt=>pt.x+","+pt.y).join(" "),zy=h-p-((0-min)/r)*(h-p*2),last=Number(data[data.length-1]?.[valueKey]||0); const pickPoint=(evt)=>{if(!data.length)return;const rect=evt.currentTarget.getBoundingClientRect();const clientX=evt.touches?.[0]?.clientX??evt.clientX;const x=((clientX-rect.left)/rect.width)*w;let best=points[0];for(const pt of points){if(Math.abs(pt.x-x)<Math.abs(best.x-x))best=pt;}setHover(best);}; return <Card title={title} sub={sub}><div className="p-5">{data.length?<svg viewBox={`0 0 ${w} ${h}`} onMouseMove={pickPoint} onTouchMove={pickPoint} onMouseLeave={()=>setHover(null)} className="h-72 w-full touch-none rounded-2xl bg-gradient-to-br from-pink-50 via-white to-violet-50"><line x1={p} x2={w-p} y1={zy} y2={zy} stroke="currentColor" className="text-slate-300" strokeDasharray="4 4"/><polyline fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" points={pts} className={last>=0?"text-emerald-500":"text-rose-500"}/><text x={p} y="24" className="fill-slate-500 text-xs">High {money(max)}</text><text x={p} y={h-8} className="fill-slate-500 text-xs">Low {money(min)}</text>{hover&&<g><line x1={hover.x} x2={hover.x} y1={p} y2={h-p} stroke="currentColor" className="text-fuchsia-300" strokeDasharray="4 4"/><circle cx={hover.x} cy={hover.y} r="6" fill="currentColor" className="text-fuchsia-600"/><rect x={hover.x>w/2?hover.x-255:hover.x+12} y={Math.max(12,hover.y-58)} width="242" height={tradeKey?"62":"46"} rx="12" fill="white" stroke="#f5d0fe"/><text x={hover.x>w/2?hover.x-242:hover.x+24} y={Math.max(34,hover.y-36)} className="fill-slate-500 text-xs">{hover.d.time}</text><text x={hover.x>w/2?hover.x-242:hover.x+24} y={Math.max(52,hover.y-18)} className={Number(hover.d[valueKey]||0)>=0?"fill-emerald-600 text-xs font-bold":"fill-rose-600 text-xs font-bold"}>{lineLabel} {signed(hover.d[valueKey])}</text>{tradeKey&&<text x={hover.x>w/2?hover.x-242:hover.x+24} y={Math.max(70,hover.y)} className={Number(hover.d[tradeKey]||0)>=0?"fill-emerald-600 text-xs":"fill-rose-600 text-xs"}>Trade P/L {signed(hover.d[tradeKey])}</text>}</g>}</svg>:<Empty text="ยังไม่มีข้อมูลกราฟ"/>}</div></Card> }
+    function NetBalance({data}){const last=data[data.length-1]?.balance||0, vals=data.map(d=>d.balance),min=Math.min(0,...vals),max=Math.max(0,...vals);return <Card title="Net Account Balance" sub="Cumulative Net P/L from 0 across the entire trading timeline"><div className="p-5"><div className="mb-4 grid gap-3 sm:grid-cols-3"><Metric label="Ending Net Balance" value={signed(last)} tone={last>=0?"good":"bad"} hint="ยอด Net P/L สะสมล่าสุด เริ่มจาก 0"/><Metric label="High Balance" value={money(max)} tone="good" hint="จุดสูงสุดของ Net Balance curve"/><Metric label="Low Balance" value={money(min)} tone={min<0?"bad":"neutral"} hint="จุดต่ำสุดของ Net Balance curve รองรับค่าติดลบ"/></div><ChartCard title="Net Balance Chart" sub="Hover/touch to see datetime and amount" data={data.length>1?data:[]} valueKey="balance" lineLabel="Balance" /></div></Card>}
+    function Equity({data}){return <ChartCard title="Intraday Equity Curve" sub="Cumulative realized FIFO P/L by sell time. Hover/touch to see datetime and amount." data={data} valueKey="cumulative" lineLabel="Equity" tradeKey="pl" />}
     function Summary({data}){return <Card title="Daily FIFO P/L Summary" sub="สรุปตามวันที่ขาย"><Table heads={["Date","Pairs","Qty","Gross P/L","Net P/L","Win/Loss"]} empty="ยังไม่มีข้อมูล">{data.map(x=><tr key={x.key} className="hover:bg-fuchsia-50/60"><td className="px-4 py-3 font-black">{x.key}</td><td className="px-4 py-3">{x.pairs}</td><td className="px-4 py-3">{qtyFmt(x.qty)}</td><td className={(x.grossPL>=0?"text-emerald-600":"text-rose-600")+" px-4 py-3 font-black"}>{signed(x.grossPL)}</td><td className={(x.netPL>=0?"text-emerald-600":"text-rose-600")+" px-4 py-3 font-black"}>{signed(x.netPL)}</td><td className="px-4 py-3"><span className="font-bold text-emerald-600">{x.wins}</span> / <span className="font-bold text-rose-600">{x.losses}</span></td></tr>)}</Table></Card>}
     function Top({title,data,good}){return <Card title={title}><Table heads={["Symbol","Sell Time","Qty","P/L","Hold"]} empty="ยังไม่มีข้อมูล">{data.map(p=><tr key={p.id} className="hover:bg-fuchsia-50/60"><td className="px-4 py-3 font-black">{p.symbol}</td><td className="px-4 py-3">{p.sellDate}</td><td className="px-4 py-3">{qtyFmt(p.qty)}</td><td className={(good?"text-emerald-600":"text-rose-600")+" px-4 py-3 font-black"}>{signed(p.pl)}</td><td className="px-4 py-3">{duration(p.holdingMinutes)}</td></tr>)}</Table></Card>}
     function RoundTrips({data}){return <Card title="Round-Trip Trade Cycles" sub="รวม FIFO fills ที่ปิดด้วย sell time เดียวกันเป็น cycle"><Table heads={["Symbol","Qty","First Buy","Sell","Avg Buy","Avg Sell","Gross P/L","Net P/L","Hold","Legs"]} empty="ยังไม่มี round trip">{data.map(x=><tr key={x.id} className="hover:bg-fuchsia-50/60"><td className="px-4 py-3 font-black">{x.symbol}</td><td className="px-4 py-3">{qtyFmt(x.qty)}</td><td className="px-4 py-3">{x.firstBuyDate}</td><td className="px-4 py-3">{x.sellDate}</td><td className="px-4 py-3">{money(x.avgBuy)}</td><td className="px-4 py-3">{money(x.avgSell)}</td><td className={(x.grossPL>=0?"text-emerald-600":"text-rose-600")+" px-4 py-3 font-black"}>{signed(x.grossPL)}</td><td className={(x.netPL>=0?"text-emerald-600":"text-rose-600")+" px-4 py-3 font-black"}>{signed(x.netPL)}</td><td className="px-4 py-3">{duration(x.holdingMinutes)}</td><td className="px-4 py-3">{x.legs}</td></tr>)}</Table></Card>}
