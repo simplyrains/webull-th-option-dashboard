@@ -67,8 +67,21 @@
       return "60m+";
     }
 
+    function normalizePdfTextForTrades(text) {
+      return String(text || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\r/g, "\n")
+        // Webull PDFs often split Trade Date into two text items/lines: "08/05" + "/2026".
+        // Rejoin that before collapsing whitespace so the row regex can see DD/MM/YYYY.
+        .replace(/(\d{2}\/\d{2})\s*\n\s*(\/\d{4})/g, "$1$2")
+        .replace(/(\d{2}\/\d{2})\s+(\/\d{4})/g, "$1$2")
+        .replace(/\n/g, " ")
+        .replace(/[ \t]+/g, " ")
+        .trim();
+    }
+
     function parseTradeRows(text, fileName) {
-      const normalized = String(text || "").replace(/\u00a0/g, " ").replace(/\n/g, " ").replace(/[ \t]+/g, " ").trim();
+      const normalized = normalizePdfTextForTrades(text);
       const toNum = v => Number(String(v || "0").replace(/,/g, ""));
       const rx = /\b([A-Z]{1,6})\s+(\d{6}[CP]\d{8})\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2}:\d{2},GMT[+-]\d{2})\s+(\d{2}\/\d{2}\/\d{4})\s+(BUY|SELL)\s+(CALL|PUT)\s+([\d,.]+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+(?:\.\d+)?)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)/g;
       const out = [];
@@ -110,11 +123,15 @@
 
     function runSelfTests() {
       const sample = "QQQ 260424C00660000 24/04/2026 23:58:06,GMT+07 27/04/2026 BUY CALL 660.00 24/04/2026 10 1.73 1,730.00 1,730.48 QQQ 260424C00660000 24/04/2026 23:58:22,GMT+07 27/04/2026 SELL CALL 660.00 24/04/2026 10 1.83 1,830.00 1,829.45";
+      const splitDateSample = "QQQ 260508C00710000   08/05
+/2026 23:04:07,GMT+07 11/05/2026 BUY CALL 710.00 08/05/2026 100 0.40 4,000.00 4,063.68 QQQ 260508C00710000   08/05 /2026 23:10:05,GMT+07 11/05/2026 SELL CALL 710.00 08/05/2026 100 0.42 4,200.00 4,135.90";
       const trades = parseTradeRows(sample, "test.pdf");
+      const splitDateTrades = parseTradeRows(splitDateSample, "split-date-test.pdf");
       const pairs = buildFifoPairs(trades);
       return [
         { name: "GMT+7 23:58:06 converts to PST same date 08:58:06", pass: convertGMT7TimeToPSTSameDate("23:58:06,GMT+07") === "08:58:06,PST" },
         { name: "Parser reads 2 trade rows", pass: trades.length === 2 },
+        { name: "Parser handles split Trade Date like 08/05 + /2026", pass: splitDateTrades.length === 2 },
         { name: "FIFO creates 1 matched pair", pass: pairs.filter(p => !p.unmatched).length === 1 },
         { name: "FIFO gross P/L = 100", pass: Math.round((pairs[0]?.pl || 0) * 100) / 100 === 100 },
         { name: "parseDateValue returns sortable number", pass: parseDateValue("24/04/2026 08:58:06,PST") > 0 }
