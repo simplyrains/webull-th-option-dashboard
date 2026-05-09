@@ -71,8 +71,8 @@
       return String(text || "")
         .replace(/\u00a0/g, " ")
         .replace(/\r/g, "\n")
-        // Webull PDFs often split Trade Date into two text items/lines: "08/05" + "/2026".
-        // Rejoin that before collapsing whitespace so the row regex can see DD/MM/YYYY.
+        // Webull PDFs often split Trade Date into two lines/items:
+        // "08/05" + "/2026" → "08/05/2026"
         .replace(/(\d{2}\/\d{2})\s*\n\s*(\/\d{4})/g, "$1$2")
         .replace(/(\d{2}\/\d{2})\s+(\/\d{4})/g, "$1$2")
         .replace(/\n/g, " ")
