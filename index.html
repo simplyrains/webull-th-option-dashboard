@@ -68,34 +68,135 @@
     }
 
     function normalizePdfTextForTrades(text) {
-      return String(text || "")
-        .replace(/\u00a0/g, " ")
-        .replace(/\r/g, String.fromCharCode(10))
-        // Webull PDFs often split Trade Date into two lines/items:
-        // "08/05" + "/2026" -> "08/05/2026"
-        .replace(/(\d{2}\/\d{2})\s*\n\s*(\/\d{4})/g, function(_, a, b) { return a + b; })
-        .replace(/(\d{2}\/\d{2})\s+(\/\d{4})/g, function(_, a, b) { return a + b; })
-        .replace(/\n/g, " ")
-        .replace(/[ \t]+/g, " ")
-        .trim();
+      let s = String(text || "");
+      const LF = String.fromCharCode(10);
+      const CR = String.fromCharCode(13);
+      const TAB = String.fromCharCode(9);
+      const NBSP = String.fromCharCode(160);
+
+      s = s.split(NBSP).join(" ");
+      s = s.split(CR + LF).join(LF).split(CR).join(LF);
+      s = s.split(LF).join(" ").split(TAB).join(" ");
+      s = s.replace(new RegExp(" +", "g"), " ").trim();
+      return s;
     }
 
     function parseTradeRows(text, fileName) {
       const normalized = normalizePdfTextForTrades(text);
-      const toNum = v => Number(String(v || "0").replace(/,/g, ""));
-      const rx = /\b([A-Z]{1,6})\s+(\d{6}[CP]\d{8})\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2}:\d{2},GMT[+-]\d{2})\s+(\d{2}\/\d{2}\/\d{4})\s+(BUY|SELL)\s+(CALL|PUT)\s+([\d,.]+)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d+(?:\.\d+)?)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)/g;
+      const toNum = function(v) { return Number(String(v || "0").replace(/,/g, "")); };
+      const tokens = normalized.split(" ").filter(Boolean);
       const out = [];
-      let m;
-      while ((m = rx.exec(normalized)) !== null) {
-        const [raw, underlying, optionCode, tradeDateOnly, time, settleDate, side, type, strike, expiryDate, q, price, gross, net] = m;
-        const pstTime = convertGMT7TimeToPSTSameDate(time), symbol = underlying + " " + optionCode;
+
+      function isSymbol(v) { return /^[A-Z]{1,6}$/.test(v || ""); }
+      function isOptionCode(v) { return /^[0-9]{6}[CP][0-9]{8}$/.test(v || ""); }
+      function isDate(v) { return /^[0-9]{2}\/[0-9]{2}\/[0-9]{4}$/.test(v || ""); }
+      function isShortDate(v) { return /^[0-9]{2}\/[0-9]{2}$/.test(v || ""); }
+      function isSlashYear(v) { return /^\/[0-9]{4}$/.test(v || ""); }
+      function isTime(v) { return /^[0-9]{2}:[0-9]{2}:[0-9]{2},GMT[+-][0-9]{2}$/.test(v || ""); }
+      function isSide(v) { return v === "BUY" || v === "SELL"; }
+      function isType(v) { return v === "CALL" || v === "PUT"; }
+      function isNum(v) { return /^[0-9][0-9,.]*$/.test(v || ""); }
+
+      function findDefaultTradeDate() {
+        for (let i = 0; i < tokens.length; i++) {
+          const t = tokens[i] || "";
+          const m = t.match(/^Period:([0-9]{2}\/[0-9]{2}\/[0-9]{4})/);
+          if (m) return m[1];
+        }
+        for (let i = 0; i < tokens.length; i++) {
+          if (isDate(tokens[i])) return tokens[i];
+        }
+        return "";
+      }
+
+      const defaultTradeDate = findDefaultTradeDate();
+      let lastTradeDayMonth = defaultTradeDate ? defaultTradeDate.slice(0, 5) : "";
+      const seen = new Set();
+
+      for (let i = 0; i < tokens.length - 10; i++) {
+        if (!isSymbol(tokens[i]) || !isOptionCode(tokens[i + 1])) continue;
+
+        let idx = i + 2;
+        let tradeDateOnly = "";
+        let shortTradeDate = "";
+
+        if (isDate(tokens[idx])) {
+          tradeDateOnly = tokens[idx];
+          shortTradeDate = tokens[idx].slice(0, 5);
+          idx += 1;
+        } else if (isShortDate(tokens[idx]) && isSlashYear(tokens[idx + 1])) {
+          tradeDateOnly = tokens[idx] + tokens[idx + 1];
+          shortTradeDate = tokens[idx];
+          idx += 2;
+        } else if (isShortDate(tokens[idx]) && isTime(tokens[idx + 1])) {
+          shortTradeDate = tokens[idx];
+          idx += 1;
+        } else if (isSlashYear(tokens[idx]) && isTime(tokens[idx + 1])) {
+          // Continuation-page edge case: row begins with /YYYY because DD/MM was extracted at previous page bottom.
+          shortTradeDate = lastTradeDayMonth || (defaultTradeDate ? defaultTradeDate.slice(0, 5) : "");
+          tradeDateOnly = shortTradeDate ? shortTradeDate + tokens[idx] : "";
+          idx += 1;
+        } else {
+          continue;
+        }
+
+        if (!isTime(tokens[idx])) continue;
+        const time = tokens[idx++];
+        if (!isDate(tokens[idx])) continue;
+        const settleDate = tokens[idx++];
+        if (!tradeDateOnly && shortTradeDate) tradeDateOnly = shortTradeDate + "/" + settleDate.slice(-4);
+        if (!tradeDateOnly) continue;
+        lastTradeDayMonth = tradeDateOnly.slice(0, 5);
+
+        if (!isSide(tokens[idx])) continue;
+        const side = tokens[idx++];
+        if (!isType(tokens[idx])) continue;
+        const type = tokens[idx++];
+
+        const strike = tokens[idx++];
+        const expiryDate = tokens[idx++];
+        const q = tokens[idx++];
+        const price = tokens[idx++];
+        const gross = tokens[idx++];
+        const net = tokens[idx++];
+
+        if (!isNum(strike) || !isDate(expiryDate) || !isNum(q) || !isNum(price) || !isNum(gross) || !isNum(net)) continue;
+
+        const underlying = tokens[i];
+        const optionCode = tokens[i + 1];
+        const pstTime = convertGMT7TimeToPSTSameDate(time);
+        const symbol = underlying + " " + optionCode;
+        const raw = tokens.slice(i, idx).join(" ");
+        const uniqueKey = symbol + "|" + tradeDateOnly + "|" + time + "|" + side + "|" + q + "|" + price + "|" + gross + "|" + net;
+        if (seen.has(uniqueKey)) continue;
+        seen.add(uniqueKey);
+
         out.push({
           id: fileName + "-" + out.length + "-" + symbol + "-" + tradeDateOnly + "-" + pstTime + "-" + side,
-          underlying, optionCode, symbol, side: side === "SELL" ? "Sell" : "Buy", type,
-          strike: toNum(strike), expiryDate, qty: toNum(q), price: toNum(price), grossAmount: toNum(gross), netAmount: toNum(net), amount: toNum(gross), currency: "USD",
-          tradeDate: tradeDateOnly + " " + pstTime, tradeDateOnly, time: pstTime, settleDate, fileName, raw
+          underlying: underlying,
+          optionCode: optionCode,
+          symbol: symbol,
+          side: side === "SELL" ? "Sell" : "Buy",
+          type: type,
+          strike: toNum(strike),
+          expiryDate: expiryDate,
+          qty: toNum(q),
+          price: toNum(price),
+          grossAmount: toNum(gross),
+          netAmount: toNum(net),
+          amount: toNum(gross),
+          currency: "USD",
+          tradeDate: tradeDateOnly + " " + pstTime,
+          tradeDateOnly: tradeDateOnly,
+          time: pstTime,
+          settleDate: settleDate,
+          fileName: fileName,
+          raw: raw
         });
+
+        i = idx - 1;
       }
+
       return out;
     }
 
@@ -140,7 +241,11 @@
             if (!buckets.has(i.y)) buckets.set(i.y, []);
             buckets.get(i.y).push(i);
           });
-          pages.push([...buckets.entries()].sort((a, b) => b[0] - a[0]).map(([, xs]) => xs.sort((a, b) => a.x - b.x).map(x => x.str).join(" ").replace(/\s+/g, " ").trim()).join("\n"));
+          const naturalText = content.items.map(function(i) { return String(i.str || "").trim(); }).filter(Boolean).join(String.fromCharCode(10));
+          const visualText = [...buckets.entries()].sort((a, b) => b[0] - a[0]).map(([, xs]) => xs.sort((a, b) => a.x - b.x).map(x => x.str).join(" ").replace(new RegExp(String.fromCharCode(92) + "s+", "g"), " ").trim()).join(String.fromCharCode(10));
+          // Keep both extraction orders. Some Webull PDFs parse correctly in natural order,
+          // while others need visual row order. parseTradeRows de-duplicates records.
+          pages.push(naturalText + String.fromCharCode(10) + visualText);
         }
         return pages.join("\n");
       }
