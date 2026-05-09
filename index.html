@@ -70,11 +70,11 @@
     function normalizePdfTextForTrades(text) {
       return String(text || "")
         .replace(/\u00a0/g, " ")
-        .replace(/\r/g, "\n")
+        .replace(/\r/g, String.fromCharCode(10))
         // Webull PDFs often split Trade Date into two lines/items:
-        // "08/05" + "/2026" → "08/05/2026"
-        .replace(/(\d{2}\/\d{2})\s*\n\s*(\/\d{4})/g, "$1$2")
-        .replace(/(\d{2}\/\d{2})\s+(\/\d{4})/g, "$1$2")
+        // "08/05" + "/2026" -> "08/05/2026"
+        .replace(/(\d{2}\/\d{2})\s*\n\s*(\/\d{4})/g, function(_, a, b) { return a + b; })
+        .replace(/(\d{2}\/\d{2})\s+(\/\d{4})/g, function(_, a, b) { return a + b; })
         .replace(/\n/g, " ")
         .replace(/[ \t]+/g, " ")
         .trim();
@@ -121,27 +121,9 @@
       return pairs.sort((a, b) => parseDateValue(a.sellDate) - parseDateValue(b.sellDate));
     }
 
-    function runSelfTests() {
-      const sample = "QQQ 260424C00660000 24/04/2026 23:58:06,GMT+07 27/04/2026 BUY CALL 660.00 24/04/2026 10 1.73 1,730.00 1,730.48 QQQ 260424C00660000 24/04/2026 23:58:22,GMT+07 27/04/2026 SELL CALL 660.00 24/04/2026 10 1.83 1,830.00 1,829.45";
-      const splitDateSample = "QQQ 260508C00710000   08/05
-/2026 23:04:07,GMT+07 11/05/2026 BUY CALL 710.00 08/05/2026 100 0.40 4,000.00 4,063.68 QQQ 260508C00710000   08/05 /2026 23:10:05,GMT+07 11/05/2026 SELL CALL 710.00 08/05/2026 100 0.42 4,200.00 4,135.90";
-      const trades = parseTradeRows(sample, "test.pdf");
-      const splitDateTrades = parseTradeRows(splitDateSample, "split-date-test.pdf");
-      const pairs = buildFifoPairs(trades);
-      return [
-        { name: "GMT+7 23:58:06 converts to PST same date 08:58:06", pass: convertGMT7TimeToPSTSameDate("23:58:06,GMT+07") === "08:58:06,PST" },
-        { name: "Parser reads 2 trade rows", pass: trades.length === 2 },
-        { name: "Parser handles split Trade Date like 08/05 + /2026", pass: splitDateTrades.length === 2 },
-        { name: "FIFO creates 1 matched pair", pass: pairs.filter(p => !p.unmatched).length === 1 },
-        { name: "FIFO gross P/L = 100", pass: Math.round((pairs[0]?.pl || 0) * 100) / 100 === 100 },
-        { name: "parseDateValue returns sortable number", pass: parseDateValue("24/04/2026 08:58:06,PST") > 0 }
-      ];
-    }
-
     function WebullDashboard() {
       const inputRef = useRef(null);
       const [files, setFiles] = useState([]), [rows, setRows] = useState([]), [rawText, setRawText] = useState(""), [loading, setLoading] = useState(false), [error, setError] = useState(""), [query, setQuery] = useState(""), [tab, setTab] = useState("overview"), [ignoreUnmatched, setIgnoreUnmatched] = useState(false);
-      const [tests] = useState(runSelfTests());
 
       async function readPdfText(file) {
         const pdfjs = getPdfJs();
@@ -257,8 +239,6 @@
           <div className="flex flex-col gap-7 lg:flex-row lg:items-center lg:justify-between"><div><div className="mb-4 inline-flex rounded-full bg-white px-4 py-2 text-sm font-semibold text-fuchsia-700 shadow-sm ring-1 ring-fuchsia-100">AI-Native · Cash Account · FIFO Execution Intelligence</div><h1 className="bg-gradient-to-r from-pink-500 via-fuchsia-600 to-violet-600 bg-clip-text text-4xl font-black tracking-tight text-transparent md:text-5xl">Webull Pro Trader Dashboard</h1><p className="mt-4 max-w-3xl text-sm leading-6 text-slate-600">Sandbox-safe PDF parser: uses PDF.js with <code>disableWorker:true</code>, converts Time from GMT+7 to PST while keeping Date unchanged, and computes FIFO P/L.</p></div><div className="flex flex-col gap-3 sm:flex-row"><input ref={inputRef} type="file" accept="application/pdf,.pdf" multiple className="hidden" onChange={e=>handleFiles(e.target.files)} /><button onClick={()=>inputRef.current?.click()} className="rounded-2xl bg-gradient-to-r from-pink-500 via-fuchsia-500 to-violet-600 px-6 py-3 text-sm font-bold text-white shadow-lg shadow-fuchsia-200">เลือกไฟล์ PDF</button><button onClick={clearAll} className="rounded-2xl border border-fuchsia-100 bg-white px-6 py-3 text-sm font-bold text-slate-700 shadow-sm">ล้างข้อมูล</button></div></div>
           <div className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-6"><Metric label="Trade Rows" value={rows.length} hint="จำนวน trade records ทั้งหมดที่อ่านได้จาก PDF ทุกไฟล์"/><Metric label="FIFO Pairs" value={metrics.valid} hint="จำนวนคู่ Buy/Sell ที่จับคู่ได้ด้วย FIFO โดยไม่รวม unmatched sell"/><Metric label="Realized P/L" value={signed(metrics.total)} tone={metrics.total>=0?"good":"bad"} hint="กำไร/ขาดทุนรวมแบบ Gross จาก FIFO pairs"/><Metric label="Net P/L" value={signed(metrics.net)} tone={metrics.net>=0?"good":"bad"} hint="กำไร/ขาดทุนรวมหลังรวมผลของค่า fee ตาม Net Amount ใน PDF"/><Metric label="Win Rate" value={metrics.winRate.toLocaleString("th-TH",{maximumFractionDigits:1})+"%"} hint="สัดส่วน FIFO pairs ที่มีกำไรเทียบกับจำนวน pairs ทั้งหมด"/><Metric label="Max DD" value={signed(metrics.maxDD)} tone="bad" hint="drawdown สูงสุดของ intraday equity curve จาก realized P/L"/></div>
         </section>
-
-        <section className="mt-6 rounded-3xl border border-fuchsia-100 bg-white p-5 shadow-sm"><h2 className="text-lg font-black text-slate-900">Self Tests</h2><div className="mt-3 grid gap-2">{tests.map(t=><div key={t.name} className={(t.pass?"text-emerald-700 bg-emerald-50":"text-rose-700 bg-rose-50")+" rounded-2xl px-4 py-3 text-sm font-bold"}>{t.pass?"✓":"✗"} {t.name}</div>)}</div></section>
 
         {files.length>0 && <section className="mt-6 rounded-3xl border border-fuchsia-100 bg-white p-5 shadow-sm"><div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between"><div><p className="mb-3 text-sm font-bold text-slate-700">ไฟล์ที่เลือก</p><div className="flex flex-wrap gap-2">{files.map(f=><span key={f.name} className="rounded-full bg-fuchsia-50 px-4 py-2 text-xs font-semibold text-fuchsia-700 ring-1 ring-fuchsia-100">{f.name}</span>)}</div></div><div className="flex flex-wrap gap-2"><SmallButton onClick={()=>downloadCsv("webull_trade_records.csv",rows)}>Export Trades</SmallButton><SmallButton onClick={()=>downloadCsv("webull_fifo_pairs.csv",fifoPairs)}>Export FIFO</SmallButton><SmallButton onClick={()=>downloadCsv("webull_round_trips.csv",roundTrips)}>Export Cycles</SmallButton></div></div></section>}
         {loading && <Notice text="กำลังอ่าน PDF..."/>}{error && <Notice text={error} danger/>}
